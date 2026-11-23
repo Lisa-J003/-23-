@@ -1,6 +1,4 @@
-"""Автономная версия для Jupyter/Colab: вставьте целиком в одну ячейку и запустите.
-Параметры: main(["--num-images", "128", "--opt-model", "efficientnet_b0"])
-"""
+"""Параметры: main(["--num-images", "128", "--opt-model", "efficientnet_b0"])"""
 
 import os
 from pathlib import Path

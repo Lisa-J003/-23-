@@ -1,0 +1,160 @@
+"""Свои параметры: main(["--model", "efficientnet_b0"])"""
+
+import os
+from pathlib import Path
+
+import numpy as np
+import torch
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from torchvision import models, transforms
+
+IMG_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+
+
+def get_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def build_model(name: str, num_classes: int = 3, pretrained: bool = False) -> torch.nn.Module:
+    """Тяжёлая (resnet50) и лёгкие (efficientnet_b0, mobilenet_v3_large) архитектуры."""
+    w = "DEFAULT" if pretrained else None
+    if name == "resnet50":
+        m = models.resnet50(weights=w)
+        m.fc = torch.nn.Linear(m.fc.in_features, num_classes)
+    elif name == "efficientnet_b0":
+        m = models.efficientnet_b0(weights=w)
+        m.classifier[1] = torch.nn.Linear(m.classifier[1].in_features, num_classes)
+    elif name == "mobilenet_v3_large":
+        m = models.mobilenet_v3_large(weights=w)
+        m.classifier[3] = torch.nn.Linear(m.classifier[3].in_features, num_classes)
+    else:
+        raise ValueError(f"Неизвестная модель: {name}")
+    return m
+
+
+def make_transform(img_size: int):
+    return transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+
+
+class SyntheticImages(Dataset):
+    """Случайные изображения высокого разрешения - имитация снимков с микроскопа.
+    Позволяет запускать проект без реальных (медицинских) данных."""
+
+    def __init__(self, n: int, src_size: int, img_size: int):
+        self.n, self.src, self.tf = n, src_size, make_transform(img_size)
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, i):
+        rng = np.random.default_rng(i)
+        arr = rng.integers(0, 255, (self.src, self.src, 3), dtype=np.uint8)
+        return self.tf(Image.fromarray(arr)), 0
+
+
+class FolderImages(Dataset):
+    """Все изображения из папки (рекурсивно). Метки не нужны - только инференс."""
+
+    def __init__(self, root: str, img_size: int, limit=None):
+        files = sorted(p for p in Path(root).rglob("*") if p.suffix.lower() in IMG_EXT)
+        if not files:
+            raise FileNotFoundError(f"В {root} нет изображений")
+        self.files = files[:limit] if limit else files
+        self.tf = make_transform(img_size)
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, i):
+        return self.tf(Image.open(self.files[i]).convert("RGB")), 0
+
+
+def make_loader(args, optimized: bool) -> DataLoader:
+    if args.data_dir:
+        ds = FolderImages(args.data_dir, args.img_size, args.num_images)
+    else:
+        ds = SyntheticImages(args.num_images, args.src_size, args.img_size)
+
+    if optimized:
+        workers = args.workers if args.workers >= 0 else min(8, os.cpu_count() or 2)
+        return DataLoader(
+            ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=workers, pin_memory=torch.cuda.is_available(),
+            persistent_workers=workers > 0,
+            prefetch_factor=4 if workers > 0 else None,
+        )
+    # baseline: один процесс, без pin_memory
+    return DataLoader(ds, batch_size=args.batch_size_baseline, shuffle=False, num_workers=0)
+
+
+import argparse
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", default="efficientnet_b0")
+    p.add_argument("--img-size", type=int, default=512)
+    p.add_argument("--out", default="results/model.onnx")
+    p.add_argument("--runs", type=int, default=30)
+    args = p.parse_known_args(argv)[0]  # known_args: безопасно для Jupyter/Colab
+
+    model = build_model(args.model).eval()
+    x = torch.randn(1, 3, args.img_size, args.img_size)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    kw = dict(
+        input_names=["image"], output_names=["logits"],
+        dynamic_axes={"image": {0: "batch"}, "logits": {0: "batch"}}, opset_version=17,
+    )
+    try:
+        # классический экспортёр: не требует пакета onnxscript
+        torch.onnx.export(model, x, args.out, dynamo=False, **kw)
+    except TypeError:  # старые версии torch без параметра dynamo
+        torch.onnx.export(model, x, args.out, **kw)
+    print(f"ONNX сохранён: {args.out}")
+
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        print("onnxruntime не установлен - сравнение пропущено")
+        return
+
+    providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider")
+                 if p in ort.get_available_providers()]
+    sess = ort.InferenceSession(args.out, providers=providers)
+    inp = x.numpy().astype(np.float32)
+    for _ in range(3):
+        sess.run(None, {"image": inp})
+    t = time.perf_counter()
+    for _ in range(args.runs):
+        sess.run(None, {"image": inp})
+    ort_ms = (time.perf_counter() - t) / args.runs * 1000
+
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    model, xt = model.to(dev), x.to(dev)
+    with torch.inference_mode():
+        for _ in range(3):
+            model(xt)
+        if dev == "cuda":
+            torch.cuda.synchronize()
+        t = time.perf_counter()
+        for _ in range(args.runs):
+            model(xt)
+        if dev == "cuda":
+            torch.cuda.synchronize()
+    pt_ms = (time.perf_counter() - t) / args.runs * 1000
+    print(f"PyTorch: {pt_ms:.1f} мс/изобр. | ONNX Runtime ({providers[0]}): {ort_ms:.1f} мс/изобр.")
+
+
+if __name__ == "__main__":
+    main()

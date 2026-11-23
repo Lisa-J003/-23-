@@ -1,0 +1,214 @@
+"""Автономная версия для Jupyter/Colab: вставьте целиком в одну ячейку и запустите.
+Параметры: main(["--num-images", "128", "--opt-model", "efficientnet_b0"])
+"""
+
+import os
+from pathlib import Path
+
+import numpy as np
+import torch
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from torchvision import models, transforms
+
+IMG_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+
+
+def get_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def build_model(name: str, num_classes: int = 3, pretrained: bool = False) -> torch.nn.Module:
+    """Тяжёлая (resnet50) и лёгкие (efficientnet_b0, mobilenet_v3_large) архитектуры."""
+    w = "DEFAULT" if pretrained else None
+    if name == "resnet50":
+        m = models.resnet50(weights=w)
+        m.fc = torch.nn.Linear(m.fc.in_features, num_classes)
+    elif name == "efficientnet_b0":
+        m = models.efficientnet_b0(weights=w)
+        m.classifier[1] = torch.nn.Linear(m.classifier[1].in_features, num_classes)
+    elif name == "mobilenet_v3_large":
+        m = models.mobilenet_v3_large(weights=w)
+        m.classifier[3] = torch.nn.Linear(m.classifier[3].in_features, num_classes)
+    else:
+        raise ValueError(f"Неизвестная модель: {name}")
+    return m
+
+
+def make_transform(img_size: int):
+    return transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+
+
+class SyntheticImages(Dataset):
+    """Случайные изображения высокого разрешения - имитация снимков с микроскопа.
+    Позволяет запускать проект без реальных (медицинских) данных."""
+
+    def __init__(self, n: int, src_size: int, img_size: int):
+        self.n, self.src, self.tf = n, src_size, make_transform(img_size)
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, i):
+        rng = np.random.default_rng(i)
+        arr = rng.integers(0, 255, (self.src, self.src, 3), dtype=np.uint8)
+        return self.tf(Image.fromarray(arr)), 0
+
+
+class FolderImages(Dataset):
+    """Все изображения из папки (рекурсивно). Метки не нужны - только инференс."""
+
+    def __init__(self, root: str, img_size: int, limit=None):
+        files = sorted(p for p in Path(root).rglob("*") if p.suffix.lower() in IMG_EXT)
+        if not files:
+            raise FileNotFoundError(f"В {root} нет изображений")
+        self.files = files[:limit] if limit else files
+        self.tf = make_transform(img_size)
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, i):
+        return self.tf(Image.open(self.files[i]).convert("RGB")), 0
+
+
+def make_loader(args, optimized: bool) -> DataLoader:
+    if args.data_dir:
+        ds = FolderImages(args.data_dir, args.img_size, args.num_images)
+    else:
+        ds = SyntheticImages(args.num_images, args.src_size, args.img_size)
+
+    if optimized:
+        workers = args.workers if args.workers >= 0 else min(8, os.cpu_count() or 2)
+        return DataLoader(
+            ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=workers, pin_memory=torch.cuda.is_available(),
+            persistent_workers=workers > 0,
+            prefetch_factor=4 if workers > 0 else None,
+        )
+    # baseline: один процесс, без pin_memory
+    return DataLoader(ds, batch_size=args.batch_size_baseline, shuffle=False, num_workers=0)
+
+
+import argparse
+import json
+import time
+from pathlib import Path
+
+import torch
+
+
+
+def sync(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+@torch.inference_mode()
+def run(args, optimized: bool, label: str) -> dict:
+    device = get_device()
+    cuda = device.type == "cuda"
+    model_name = args.opt_model if optimized else args.model
+    torch.backends.cudnn.benchmark = optimized and cuda
+
+    model = build_model(model_name, args.num_classes).to(device).eval()
+    use_cl = optimized and cuda
+    if use_cl:
+        model = model.to(memory_format=torch.channels_last)
+    if optimized and args.compile:
+        model = torch.compile(model)
+
+    loader = make_loader(args, optimized)
+    bs = args.batch_size if optimized else args.batch_size_baseline
+    use_amp = optimized and cuda
+
+    # прогрев (cuDNN autotune, компиляция)
+    dummy = torch.randn(bs, 3, args.img_size, args.img_size, device=device)
+    if use_cl:
+        dummy = dummy.contiguous(memory_format=torch.channels_last)
+    for _ in range(3):
+        with torch.autocast(device.type, dtype=torch.float16, enabled=use_amp):
+            model(dummy)
+    sync(device)
+    if cuda:
+        torch.cuda.reset_peak_memory_stats()
+
+    data_t = comp_t = 0.0
+    n_images = 0
+    t_start = t_prev = time.perf_counter()
+    for x, _ in loader:
+        t0 = time.perf_counter()
+        data_t += t0 - t_prev                      # ожидание данных (GPU простаивает)
+        x = x.to(device, non_blocking=optimized)
+        if use_cl:
+            x = x.contiguous(memory_format=torch.channels_last)
+        with torch.autocast(device.type, dtype=torch.float16, enabled=use_amp):
+            model(x)
+        sync(device)
+        t_prev = time.perf_counter()
+        comp_t += t_prev - t0
+        n_images += x.shape[0]
+    total = time.perf_counter() - t_start
+
+    res = {
+        "label": label,
+        "device": str(device),
+        "model": model_name,
+        "batch_size": bs,
+        "amp_fp16": use_amp,
+        "channels_last": use_cl,
+        "workers": loader.num_workers,
+        "images": n_images,
+        "total_sec": round(total, 3),
+        "sec_per_image": round(total / n_images, 5),
+        "images_per_sec": round(n_images / total, 2),
+        "gpu_busy_ratio": round(comp_t / (comp_t + data_t), 3),
+        "peak_gpu_mem_mb": round(torch.cuda.max_memory_allocated() / 2**20, 1) if cuda else None,
+    }
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+    return res
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser()
+    p.add_argument("--data-dir", default=None, help="папка с изображениями; без неё - синтетика")
+    p.add_argument("--num-images", type=int, default=256)
+    p.add_argument("--src-size", type=int, default=2000, help="размер синтетических снимков, px")
+    p.add_argument("--img-size", type=int, default=512, help="вход модели, px")
+    p.add_argument("--num-classes", type=int, default=3)
+    p.add_argument("--model", default="resnet50", help="модель в базовой версии")
+    p.add_argument("--opt-model", default="resnet50",
+                   help="модель в оптимизированной версии (напр. efficientnet_b0)")
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--batch-size-baseline", type=int, default=4)
+    p.add_argument("--workers", type=int, default=-1, help="-1 = авто")
+    p.add_argument("--compile", action="store_true", help="включить torch.compile")
+    p.add_argument("--out", default="results/benchmark.json")
+    args = p.parse_known_args(argv)[0]  # known_args: безопасно для Jupyter/Colab
+
+    base = run(args, optimized=False, label="baseline")
+    opt = run(args, optimized=True, label="optimized")
+
+    summary = {
+        "speedup_x": round(base["sec_per_image"] / opt["sec_per_image"], 2),
+        "gpu_busy_before": base["gpu_busy_ratio"],
+        "gpu_busy_after": opt["gpu_busy_ratio"],
+        "mem_before_mb": base["peak_gpu_mem_mb"],
+        "mem_after_mb": opt["peak_gpu_mem_mb"],
+    }
+    print("\n=== ИТОГ ===")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text(
+        json.dumps({"baseline": base, "optimized": opt, "summary": summary},
+                   ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Сохранено: {args.out}")
+
+
+if __name__ == "__main__":
+    main()
